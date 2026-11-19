@@ -1,5 +1,6 @@
 package storage;
 
+import logic.Validator;
 import model.InvalidInputException;
 import model.Patient;
 import model.QueueTicket;
@@ -7,54 +8,111 @@ import model.TicketStatus;
 import model.Visit;
 
 import java.time.LocalDate;
+import java.time.format.DateTimeParseException;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 
-/**
- * Converts records to and from one line of text.
- * Patient line: id|name|age
- * Ticket line:  number|patientId|visitType|notes|status|issuedDate|servedDate
- * The "|" character is removed from free text so it can never break a line.
- */
-public class RecordConverter {
-    private static final String SEP = "|";
+public final class RecordConverter {
+    private static final char SEP = '|';
+    private static final char ESC = '\\';
+    private static final int PATIENT_FIELDS = 3;
+    private static final int TICKET_FIELDS = 7;
+
+    private RecordConverter() { }
 
     public static String patientToLine(Patient p) {
-        return p.getId() + SEP + clean(p.getName()) + SEP + p.getAge();
+        return p.getId() + String.valueOf(SEP) + escape(p.getName()) + SEP + p.getAge();
     }
 
     public static Patient lineToPatient(String line) {
-        String[] f = line.split("\\|", -1);
-        if (f.length != 3) throw new InvalidInputException("Bad patient line: " + line);
+        List<String> f = split(line);
+        if (f.size() != PATIENT_FIELDS) throw new InvalidInputException("Bad patient line: " + line);
         try {
-            return new Patient(Integer.parseInt(f[0].trim()), f[1].trim(), Integer.parseInt(f[2].trim()));
+            int id = Integer.parseInt(f.get(0).trim());
+            String name = f.get(1).trim();
+            int age = Integer.parseInt(f.get(2).trim());
+            if (id < 1) throw new InvalidInputException("Patient id must be positive: " + line);
+            Validator.validateName(name);
+            Validator.validateAge(age);
+            return new Patient(id, name, age);
         } catch (NumberFormatException e) {
             throw new InvalidInputException("Bad number in patient line: " + line);
         }
     }
 
     public static String ticketToLine(QueueTicket t) {
-        return t.getNumber() + SEP + t.getPatient().getId() + SEP + t.getVisitType() + SEP
-                + clean(t.getVisit().getNotes()) + SEP + t.getStatus().name() + SEP
-                + t.getIssuedDate() + SEP + (t.getServedDate() == null ? "" : t.getServedDate());
+        return t.getNumber() + String.valueOf(SEP) + t.getPatient().getId() + SEP
+                + escape(t.getVisitType()) + SEP + escape(t.getVisit().getNotes()) + SEP
+                + t.getStatus().name() + SEP + t.getIssuedDate() + SEP
+                + (t.getServedDate() == null ? "" : t.getServedDate());
     }
 
-    /** patientsById lets the ticket find its patient; an unknown id means a damaged record. */
     public static QueueTicket lineToTicket(String line, Map<Integer, Patient> patientsById) {
-        String[] f = line.split("\\|", -1);
-        if (f.length != 7) throw new InvalidInputException("Bad ticket line: " + line);
+        List<String> f = split(line);
+        if (f.size() != TICKET_FIELDS) throw new InvalidInputException("Bad ticket line: " + line);
         try {
-            Patient p = patientsById.get(Integer.parseInt(f[1].trim()));
+            int number = Integer.parseInt(f.get(0).trim());
+            int patientId = Integer.parseInt(f.get(1).trim());
+            if (number < 1) throw new InvalidInputException("Ticket number must be positive: " + line);
+            Patient p = patientsById.get(patientId);
             if (p == null) throw new InvalidInputException("Ticket refers to a missing patient: " + line);
-            LocalDate served = f[6].trim().isEmpty() ? null : LocalDate.parse(f[6].trim());
-            return new QueueTicket(Integer.parseInt(f[0].trim()), p, Visit.fromTypeName(f[2], f[3]),
-                    TicketStatus.valueOf(f[4].trim()), LocalDate.parse(f[5].trim()), served);
-        } catch (RuntimeException e) {
-            if (e instanceof InvalidInputException) throw e;
-            throw new InvalidInputException("Bad ticket line: " + line);
+
+            Visit visit = Visit.fromTypeName(f.get(2), f.get(3));
+            TicketStatus status = TicketStatus.valueOf(f.get(4).trim().toUpperCase());
+            LocalDate issued = LocalDate.parse(f.get(5).trim());
+            String servedText = f.get(6).trim();
+            LocalDate served = servedText.isEmpty() ? null : LocalDate.parse(servedText);
+
+            if (status == TicketStatus.SERVED && served == null) served = issued;
+            if (status != TicketStatus.SERVED) served = null;
+
+            return new QueueTicket(number, p, visit, status, issued, served);
+        } catch (NumberFormatException | DateTimeParseException e) {
+            throw new InvalidInputException("Bad number or date in ticket line: " + line);
+        } catch (IllegalArgumentException e) {
+            throw new InvalidInputException("Bad status in ticket line: " + line);
         }
     }
 
-    private static String clean(String s) {
-        return s == null ? "" : s.replace("|", " ").replace("\n", " ").replace("\r", " ");
+    static String escape(String s) {
+        if (s == null) return "";
+        StringBuilder sb = new StringBuilder(s.length() + 8);
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            switch (c) {
+                case ESC: sb.append(ESC).append(ESC); break;
+                case SEP: sb.append(ESC).append(SEP); break;
+                case '\n': sb.append(ESC).append('n'); break;
+                case '\r': sb.append(ESC).append('r'); break;
+                default:   sb.append(c);
+            }
+        }
+        return sb.toString();
+    }
+
+    static List<String> split(String line) {
+        List<String> fields = new ArrayList<>();
+        StringBuilder cur = new StringBuilder();
+        for (int i = 0; i < line.length(); i++) {
+            char c = line.charAt(i);
+            if (c == ESC && i + 1 < line.length()) {
+                char next = line.charAt(++i);
+                switch (next) {
+                    case 'n': cur.append('\n'); break;
+                    case 'r': cur.append('\r'); break;
+                    case ESC: cur.append(ESC); break;
+                    case SEP: cur.append(SEP); break;
+                    default:  cur.append(ESC).append(next);
+                }
+            } else if (c == SEP) {
+                fields.add(cur.toString());
+                cur.setLength(0);
+            } else {
+                cur.append(c);
+            }
+        }
+        fields.add(cur.toString());
+        return fields;
     }
 }
